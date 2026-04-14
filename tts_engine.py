@@ -5,12 +5,14 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.request
 import wave
 from io import BytesIO
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import config
 
@@ -20,6 +22,69 @@ except ImportError:
     pyaudio = None
 
 SERVICE_CODE = "qwen_tts"
+SUPPORTED_FORMATS = {"wav", "mp3", "ogg"}
+MOCK_WAV_BYTES = (
+    b"RIFF$\x00\x00\x00WAVEfmt "
+    b"\x10\x00\x00\x00\x01\x00\x01\x00"
+    b"\xc0]\x00\x00\x80\xbb\x00\x00"
+    b"\x02\x00\x10\x00data\x00\x00\x00\x00"
+)
+
+
+def ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def build_output_path(text: str, audio_format: str) -> str:
+    safe_name = re.sub(r"[^\w\u4e00-\u9fff-]+", "-", text.strip())[:24].strip("-") or "secretary-audio"
+    return os.path.join(os.path.expanduser("~"), ".hermes", "audio_cache", f"{safe_name}.{audio_format}")
+
+
+def normalize_output_path(output_path: str, audio_format: str) -> str:
+    root, ext = os.path.splitext(output_path)
+    expected_ext = f".{audio_format.lower()}"
+    if ext.lower() == expected_ext:
+        return output_path
+    return root + expected_ext
+
+
+def build_hermes_media_output(file_path: str, audio_as_voice: bool = False) -> str:
+    media = f"MEDIA:{file_path}"
+    if audio_as_voice:
+        return f"[[audio_as_voice]]\n{media}"
+    return media
+
+
+def convert_audio_file(source_path: str, target_path: str, audio_format: str) -> str:
+    audio_format = audio_format.lower()
+    if audio_format not in SUPPORTED_FORMATS:
+        raise ValueError(f"不支持的音频格式: {audio_format}")
+
+    if source_path == target_path:
+        return target_path
+
+    ensure_parent_dir(target_path)
+
+    if audio_format == "wav":
+        shutil.copyfile(source_path, target_path)
+        return target_path
+
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("未找到 ffmpeg，无法进行音频格式转换。")
+
+    command = ["ffmpeg", "-y", "-i", source_path]
+    if audio_format == "mp3":
+        command += [target_path]
+    elif audio_format == "ogg":
+        command += ["-acodec", "libopus", "-ac", "1", "-b:a", "64k", "-vbr", "off", target_path]
+
+    result = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
+    if result.returncode != 0 or not os.path.exists(target_path) or os.path.getsize(target_path) == 0:
+        error_msg = (result.stderr or result.stdout or "未知错误").strip()
+        raise RuntimeError(f"音频转换失败: {error_msg}")
+    return target_path
 
 
 class TTSEngine:
@@ -31,19 +96,26 @@ class TTSEngine:
         self.speech_rate = config.TTS_SPEECH_RATE
         self.instructions = config.TTS_INSTRUCTIONS
         self.audio = None
+        self._audio_init_attempted = False
 
         if not self.mock_mode and not self._skill_atlas_available():
             self.mock_mode = True
             print("[Info] 已自动切换到 Mock 模式。")
 
+    def _ensure_audio(self) -> None:
+        if self._audio_init_attempted:
+            return
+
+        self._audio_init_attempted = True
         if pyaudio is None:
             print("[Info] 未安装 pyaudio，将只输出文本，不播放音频。")
-        else:
-            try:
-                self.audio = pyaudio.PyAudio()
-            except Exception as exc:
-                print(f"[Warning] 初始化音频设备失败，将只输出文本: {exc}")
-                self.audio = None
+            return
+
+        try:
+            self.audio = pyaudio.PyAudio()
+        except Exception as exc:
+            print(f"[Warning] 初始化音频设备失败，将只输出文本: {exc}")
+            self.audio = None
 
     def _skill_atlas_available(self) -> bool:
         try:
@@ -118,42 +190,6 @@ class TTSEngine:
                 return value
         return None
 
-    def speak(self, text: str) -> Optional[str]:
-        print(f"[Speak] {text}")
-
-        if self.mock_mode:
-            print(f"[Mock] {text}")
-            return "MOCK"
-
-        payload = {
-            "text": text,
-            "model": self.model,
-            "voice": self.voice,
-            "language": self.language,
-            "speechRate": self.speech_rate,
-            "instructions": self.instructions,
-        }
-
-        try:
-            response = self._invoke_service_gateway(payload)
-        except Exception as exc:
-            print(f"[Error] TTS 调用失败: {exc}")
-            return None
-
-        if isinstance(response, str):
-            return self._play_audio_url(response)
-
-        audio_data = self._pick_value(response, "audioData", "audio_data")
-        audio_url = self._pick_value(response, "audioUrl", "audio_url", "url")
-
-        if audio_data:
-            return self._play_audio_bytes(self._decode_audio_data(audio_data))
-        if audio_url:
-            return self._play_audio_url(audio_url)
-
-        print("[Error] 服务响应中未找到可播放的音频字段。")
-        return None
-
     def _pick_value(self, response: dict[str, Any], *keys: str) -> Optional[str]:
         for key in keys:
             value = response.get(key)
@@ -174,16 +210,16 @@ class TTSEngine:
         except Exception as exc:
             raise RuntimeError(f"音频解码失败: {exc}") from exc
 
-    def _play_audio_url(self, url: str) -> Optional[str]:
-        try:
-            request = urllib.request.Request(url, headers=self._asset_headers())
-            with urllib.request.urlopen(request, timeout=60) as response:
-                audio_bytes = response.read()
-        except Exception as exc:
-            print(f"[Error] 音频下载失败: {exc}")
-            return None
+    def _asset_headers_for_url(self, url: str) -> dict[str, str]:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if host != "skillatlas.cn" and not host.endswith(".skillatlas.cn"):
+            return {}
 
-        return self._play_audio_bytes(audio_bytes, source=url)
+        token = self._load_skillatlas_token()
+        if not token:
+            return {}
+        return {"Authorization": f"Bearer {token}"}
 
     def _asset_headers(self) -> dict[str, str]:
         token = self._load_skillatlas_token()
@@ -209,7 +245,49 @@ class TTSEngine:
             return token
         return None
 
-    def _play_audio_bytes(self, audio_bytes: bytes, source: str = "inline-audio") -> Optional[str]:
+    def _download_audio_url(self, url: str) -> bytes:
+        try:
+            request = urllib.request.Request(url, headers=self._asset_headers_for_url(url))
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return response.read()
+        except Exception as exc:
+            raise RuntimeError(f"音频下载失败: {exc}") from exc
+
+    def synthesize(self, text: str) -> bytes:
+        if self.mock_mode:
+            return MOCK_WAV_BYTES
+
+        payload = {
+            "text": text,
+            "model": self.model,
+            "voice": self.voice,
+            "language": self.language,
+            "speechRate": self.speech_rate,
+            "instructions": self.instructions,
+        }
+        response = self._invoke_service_gateway(payload)
+
+        if isinstance(response, str):
+            return self._download_audio_url(response)
+
+        audio_data = self._pick_value(response, "audioData", "audio_data")
+        audio_url = self._pick_value(response, "audioUrl", "audio_url", "url")
+
+        if audio_data:
+            return self._decode_audio_data(audio_data)
+        if audio_url:
+            return self._download_audio_url(audio_url)
+
+        raise RuntimeError("服务响应中未找到可播放的音频字段。")
+
+    def save_audio(self, audio_bytes: bytes, output_path: str) -> str:
+        ensure_parent_dir(output_path)
+        with open(output_path, "wb") as file:
+            file.write(audio_bytes)
+        return output_path
+
+    def play_audio(self, audio_bytes: bytes, source: str = "inline-audio") -> Optional[str]:
+        self._ensure_audio()
         try:
             with wave.open(BytesIO(audio_bytes), "rb") as wav_file:
                 params = wav_file.getparams()
@@ -241,6 +319,44 @@ class TTSEngine:
         print("[Info] 音频播放完成。")
         return source
 
+    def export(self, text: str, output_path: Optional[str] = None, audio_format: str = "wav", play_audio: bool = True) -> Optional[str]:
+        audio_format = audio_format.lower()
+        if audio_format not in SUPPORTED_FORMATS:
+            raise ValueError(f"不支持的音频格式: {audio_format}")
+
+        requested_path = output_path or build_output_path(text, audio_format)
+        final_output_path = normalize_output_path(requested_path, audio_format)
+        base_wav_path = final_output_path if audio_format == "wav" else os.path.splitext(final_output_path)[0] + ".wav"
+
+        audio_bytes = self.synthesize(text)
+        self.save_audio(audio_bytes, base_wav_path)
+
+        final_path = base_wav_path
+        if audio_format != "wav":
+            final_path = convert_audio_file(base_wav_path, final_output_path, audio_format)
+            if base_wav_path != final_path and os.path.exists(base_wav_path):
+                os.remove(base_wav_path)
+
+        if play_audio:
+            self.play_audio(audio_bytes, source=final_path)
+
+        return final_path
+
+    def speak(self, text: str) -> Optional[str]:
+        print(f"[Speak] {text}")
+
+        if self.mock_mode:
+            print(f"[Mock] {text}")
+            return "MOCK"
+
+        try:
+            audio_bytes = self.synthesize(text)
+        except Exception as exc:
+            print(f"[Error] TTS 调用失败: {exc}")
+            return None
+
+        return self.play_audio(audio_bytes)
+
     def close(self) -> None:
         if self.audio is not None:
             self.audio.terminate()
@@ -249,15 +365,25 @@ class TTSEngine:
 def main() -> int:
     parser = argparse.ArgumentParser(description="贴心小秘书 TTS 测试")
     parser.add_argument("--mock", action="store_true", help="使用 Mock 模式")
-    parser.add_argument(
-        "--text",
-        required=True,
-        help="要播报的文本",
-    )
+    parser.add_argument("--text", required=True, help="要播报的文本")
+    parser.add_argument("--output", help="导出音频到指定路径")
+    parser.add_argument("--format", choices=sorted(SUPPORTED_FORMATS), default="wav", help="导出音频格式")
+    parser.add_argument("--no-play", action="store_true", help="只导出，不进行本地播放")
+    parser.add_argument("--hermes-media", action="store_true", help="按 Hermes MEDIA 格式输出结果")
+    parser.add_argument("--audio-as-voice", action="store_true", help="配合 --hermes-media 输出语音消息指令")
     args = parser.parse_args()
 
     engine = TTSEngine(mock_mode=args.mock)
     try:
+        if args.output or args.hermes_media or args.no_play:
+            output_path = args.output or build_output_path(args.text, args.format)
+            exported = engine.export(args.text, output_path=output_path, audio_format=args.format, play_audio=not args.no_play)
+            if args.hermes_media and exported:
+                print(build_hermes_media_output(exported, audio_as_voice=args.audio_as_voice))
+            elif exported:
+                print(json.dumps({"success": True, "file_path": exported, "format": args.format}, ensure_ascii=False))
+            return 0 if exported else 1
+
         engine.speak(args.text)
         return 0
     finally:
