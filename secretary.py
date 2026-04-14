@@ -1,10 +1,9 @@
 import argparse
-import json
 import re
 import sys
 import time
 
-from tts_engine import TTSEngine, SUPPORTED_FORMATS, build_hermes_media_output, build_output_path
+from tts_engine import TTSEngine, SUPPORTED_FORMATS, SUPPORTED_OUTPUT_MODES, build_output_path, format_output
 
 try:
     from scheduler import SchedulerUnavailableError, SecretaryScheduler
@@ -80,8 +79,13 @@ def main() -> int:
     parser.add_argument("--export", help="将播报音频导出到指定路径")
     parser.add_argument("--format", choices=sorted(SUPPORTED_FORMATS), default="wav", help="导出音频格式")
     parser.add_argument("--no-play", action="store_true", help="导出时不进行本地播放")
-    parser.add_argument("--hermes-media", action="store_true", help="按 Hermes MEDIA 格式输出导出结果")
-    parser.add_argument("--audio-as-voice", action="store_true", help="配合 --hermes-media 输出语音消息指令")
+    parser.add_argument(
+        "--output-mode",
+        choices=sorted(SUPPORTED_OUTPUT_MODES),
+        default="json",
+        help="导出结果输出模式，默认 json；hermes 仅为兼容选项",
+    )
+    parser.add_argument("--voice-message", action="store_true", help="将结果标记为语音消息候选")
     args = parser.parse_args()
 
     if not args.say and not args.daily:
@@ -103,10 +107,7 @@ def main() -> int:
                 play_audio=not args.no_play,
             )
             if exported:
-                if args.hermes_media:
-                    print(build_hermes_media_output(exported, audio_as_voice=args.audio_as_voice))
-                else:
-                    print(json.dumps({"success": True, "file_path": exported, "format": args.format}, ensure_ascii=False))
+                print(format_output(exported, args.format, output_mode=args.output_mode, voice_message=args.voice_message))
 
         if args.daily:
             should_close_engine = False

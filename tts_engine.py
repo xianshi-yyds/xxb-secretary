@@ -23,6 +23,7 @@ except ImportError:
 
 SERVICE_CODE = "qwen_tts"
 SUPPORTED_FORMATS = {"wav", "mp3", "ogg"}
+SUPPORTED_OUTPUT_MODES = {"json", "path", "media-tag", "hermes"}
 MOCK_WAV_BYTES = (
     b"RIFF$\x00\x00\x00WAVEfmt "
     b"\x10\x00\x00\x00\x01\x00\x01\x00"
@@ -55,6 +56,36 @@ def build_hermes_media_output(file_path: str, audio_as_voice: bool = False) -> s
     if audio_as_voice:
         return f"[[audio_as_voice]]\n{media}"
     return media
+
+
+def build_output_payload(file_path: str, audio_format: str, voice_candidate: bool = False) -> dict[str, Any]:
+    return {
+        "success": True,
+        "file_path": file_path,
+        "format": audio_format,
+        "media_type": "audio",
+        "voice_candidate": voice_candidate,
+    }
+
+
+def format_output(
+    file_path: str,
+    audio_format: str,
+    output_mode: str = "json",
+    voice_message: bool = False,
+) -> str:
+    if output_mode == "json":
+        return json.dumps(
+            build_output_payload(file_path, audio_format, voice_candidate=voice_message),
+            ensure_ascii=False,
+        )
+    if output_mode == "path":
+        return file_path
+    if output_mode == "media-tag":
+        return f"MEDIA:{file_path}"
+    if output_mode == "hermes":
+        return build_hermes_media_output(file_path, audio_as_voice=voice_message)
+    raise ValueError(f"不支持的输出模式: {output_mode}")
 
 
 def convert_audio_file(source_path: str, target_path: str, audio_format: str) -> str:
@@ -369,19 +400,22 @@ def main() -> int:
     parser.add_argument("--output", help="导出音频到指定路径")
     parser.add_argument("--format", choices=sorted(SUPPORTED_FORMATS), default="wav", help="导出音频格式")
     parser.add_argument("--no-play", action="store_true", help="只导出，不进行本地播放")
-    parser.add_argument("--hermes-media", action="store_true", help="按 Hermes MEDIA 格式输出结果")
-    parser.add_argument("--audio-as-voice", action="store_true", help="配合 --hermes-media 输出语音消息指令")
+    parser.add_argument(
+        "--output-mode",
+        choices=sorted(SUPPORTED_OUTPUT_MODES),
+        default="json",
+        help="导出结果输出模式，默认 json；hermes 仅为兼容选项",
+    )
+    parser.add_argument("--voice-message", action="store_true", help="将结果标记为语音消息候选")
     args = parser.parse_args()
 
     engine = TTSEngine(mock_mode=args.mock)
     try:
-        if args.output or args.hermes_media or args.no_play:
+        if args.output or args.output_mode != "json" or args.no_play:
             output_path = args.output or build_output_path(args.text, args.format)
             exported = engine.export(args.text, output_path=output_path, audio_format=args.format, play_audio=not args.no_play)
-            if args.hermes_media and exported:
-                print(build_hermes_media_output(exported, audio_as_voice=args.audio_as_voice))
-            elif exported:
-                print(json.dumps({"success": True, "file_path": exported, "format": args.format}, ensure_ascii=False))
+            if exported:
+                print(format_output(exported, args.format, output_mode=args.output_mode, voice_message=args.voice_message))
             return 0 if exported else 1
 
         engine.speak(args.text)
